@@ -1,50 +1,55 @@
-/*
- * Copyright (c) 2014-2026 Bjoern Kimminich & the OWASP Juice Shop contributors.
- * SPDX-License-Identifier: MIT
- */
-
-import fs from 'node:fs'
-import { Readable } from 'node:stream'
-import { finished } from 'node:stream/promises'
-import { type Request, type Response, type NextFunction } from 'express'
-
-import * as security from '../lib/insecurity'
-import { UserModel } from '../models/user'
-import * as utils from '../lib/utils'
-import logger from '../lib/logger'
-
 export function profileImageUrlUpload () {
   return async (req: Request, res: Response, next: NextFunction) => {
+
     if (req.body.imageUrl !== undefined) {
-      const url = req.body.imageUrl
-      if (url.match(/(.)*solve\/challenges\/server-side(.)*/) !== null) req.app.locals.abused_ssrf_bug = true
-      const loggedInUser = security.authenticatedUsers.get(req.cookies.token)
-      if (loggedInUser) {
-        try {
-          const response = await fetch(url)
-          if (!response.ok || !response.body) {
-            throw new Error('url returned a non-OK status code or an empty body')
-          }
-          const ext = ['jpg', 'jpeg', 'png', 'svg', 'gif'].includes(url.split('.').slice(-1)[0].toLowerCase()) ? url.split('.').slice(-1)[0].toLowerCase() : 'jpg'
-          const fileStream = fs.createWriteStream(`frontend/dist/frontend/assets/public/images/uploads/${loggedInUser.data.id}.${ext}`, { flags: 'w' })
-          await finished(Readable.fromWeb(response.body as any).pipe(fileStream))
-          await UserModel.findByPk(loggedInUser.data.id).then(async (user: UserModel | null) => { return await user?.update({ profileImage: `/assets/public/images/uploads/${loggedInUser.data.id}.${ext}` }) }).catch((error: Error) => { next(error) })
-        } catch (error) {
-          try {
-            const user = await UserModel.findByPk(loggedInUser.data.id)
-            await user?.update({ profileImage: url })
-            logger.warn(`Error retrieving user profile image: ${utils.getErrorMessage(error)}; using image link directly`)
-          } catch (error) {
-            next(error)
-            return
-          }
-        }
-      } else {
-        next(new Error('Blocked illegal activity by ' + req.socket.remoteAddress))
-        return
+
+      let url: URL;
+
+      try {
+        url = new URL(req.body.imageUrl);   // Parse URL safely
+      } catch {
+        return res.status(400).send("INVALID_URL_FORMAT");
+      }
+
+      // Allowed protocols
+      const allowedSchemes = ["http:", "https:"];
+
+      // Allowed trusted domains only (modify as needed)
+      const trustedDomains = ["images.myserver.com", "cdn.example.com"];
+
+      // 🚫 Block URL if NOT trusted or protocol invalid
+      if (!allowedSchemes.includes(url.protocol) || !trustedDomains.includes(url.hostname)) {
+        return res.status(400).send("UNSAFE OR UNTRUSTED URL BLOCKED");
+      }
+
+      const loggedInUser = security.authenticatedUsers.get(req.cookies.token);
+      if (!loggedInUser) {
+        return next(new Error('Blocked illegal activity by ' + req.socket.remoteAddress));
+      }
+
+      try {
+        const response = await fetch(url.href);
+        if (!response.ok || !response.body) throw new Error("URL returned invalid response");
+
+        const ext = ['jpg','jpeg','png','svg','gif'].includes(url.pathname.split('.').pop()?.toLowerCase() || '')
+          ? url.pathname.split('.').pop()!.toLowerCase()
+          : 'jpg';
+
+        const filePath = `frontend/dist/frontend/assets/public/images/uploads/${loggedInUser.data.id}.${ext}`;
+        const fsStream = fs.createWriteStream(filePath);
+
+        await finished(Readable.fromWeb(response.body as any).pipe(fsStream));
+
+        await UserModel.findByPk(loggedInUser.data.id)
+          .then(user => user?.update({ profileImage: `/assets/public/images/uploads/${loggedInUser.data.id}.${ext}` }))
+          .catch(err => next(err));
+
+      } catch (error) {
+        logger.warn("Image fetch failed: " + utils.getErrorMessage(error));
+        return res.status(500).send("IMAGE_DOWNLOAD_ERROR");
       }
     }
-    res.location(process.env.BASE_PATH + '/profile')
-    res.redirect(process.env.BASE_PATH + '/profile')
-  }
+
+    res.redirect(process.env.BASE_PATH + '/profile');
+  };
 }
